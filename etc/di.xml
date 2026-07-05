@@ -1,35 +1,9 @@
 <?xml version="1.0"?>
 <config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
     <!--
-        Prefer our Page\Config subclass so the Resetter calls _resetState() directly.
-        reset.json's ReflectionProperty approach silently fails on PHP 8.4 lazy ghosts: setValue()
-        from the parent-class ReflectionProperty writes into the parent scope on the Interceptor ghost,
-        but running code reads the Interceptor scope (still uninitialized), triggering the lazy
-        initializer and overwriting the reset. Our subclass implements ResetAfterRequestInterface so
-        the Resetter calls _resetState() as a method — which initializes the ghost first and then
-        writes into the live property slot that running code actually uses.
-        See: MageOS\WorkerMode\View\Page\Config for the full explanation.
-    -->
-    <preference for="Magento\Framework\View\Page\Config"
-                type="MageOS\WorkerMode\View\Page\Config"/>
-
-    <!--
-        Prefer our Design subclass so the Resetter calls _resetState() directly.
-        reset.json's ReflectionProperty approach silently fails on PHP 8.4 lazy ghosts for the same
-        reason as Page\Config: setValue() from the parent-class ReflectionProperty writes into the
-        parent scope on the Interceptor ghost, but running code reads the Interceptor scope (still
-        uninitialized), triggering the lazy initializer which overwrites the reset.
-        Result: _area persists as 'webapi_rest' across requests — frontend pages render with
-        webapi_rest area CSS URLs and a blank body.
-    -->
-    <preference for="Magento\Theme\Model\View\Design"
-                type="MageOS\WorkerMode\Model\View\Design"/>
-
-    <!--
-        Plugin on Page\Config::getElementAttributes() to ensure html.lang is always present.
-        _resetState() clears elements=[], which wipes the html.lang set in the constructor.
-        Without html.lang, document.documentElement.lang is "" and Intl.NumberFormat breaks
-        (ElasticSuite price slider).
+        html.lang guard: Page\Config reset clears elements=[] between requests, wiping the html.lang set
+        in the constructor. Without it document.documentElement.lang is "" and Intl.NumberFormat breaks
+        (ElasticSuite price slider). This after-plugin re-adds it.
     -->
     <type name="Magento\Framework\View\Page\Config">
         <plugin name="mage_os_worker_mode_html_lang_attribute"
@@ -37,24 +11,20 @@
     </type>
 
     <!--
-        Prefer our Layout subclass so the Resetter calls _resetState() directly (ResetAfterRequestInterface).
-        This resets readerContext (not covered by opengento's reset.json) which otherwise carries stale
-        scheduledPaths from request 1 — causing _overrideElementWorkaround to delete head.js and
-        head.hyva-scripts when the theme re-declares head.additional on request 2+.
-        Also resets _xml so stale merged layout XML from the previous request does not cause
-        isCacheable() to incorrectly treat the checkout success page as cacheable.
+        Layout subclass (ResetAfterRequestInterface). The framework Resetter's reflection path silently
+        fails on PHP 8.4 lazy-ghost Interceptors (see OPENGENTO_UPSTREAM_CHANGES.md "Change 4"), so state
+        that must reset between requests is handled via a real _resetState() here (_xml, _blocks,
+        readerContext, ...). Unlike Design/Page\Config/Area this stays a subclass because it ALSO overrides
+        isCacheable()/generateElements() (behavioural fix for the checkout-success depersonalize bug), so it
+        cannot be a plain LazyGhostReset target. It is the one remaining framework <preference>.
     -->
     <preference for="Magento\Framework\View\Layout"
                 type="MageOS\WorkerMode\Model\View\Layout"/>
 
     <!--
-        The opengento/module-application worker package sets isIsolated=true on Page and Layout result
-        types so each request gets a private layout instance. This breaks Hyvä's ProductListItem view
-        model, which holds the shared LayoutInterface singleton and calls getBlock() on it — blocks
-        are never found because they live in the isolated instance instead.
-
-        The reset.json mechanism (Resetter) already resets Layout state between requests, so isolation
-        is not needed. Setting isIsolated=false restores the shared singleton behaviour.
+        opengento sets isIsolated=true on Page/Layout result types (a private layout per request), which
+        breaks Hyvä's ProductListItem view model (it holds the shared LayoutInterface and calls getBlock()).
+        The Resetter already resets Layout state between requests, so isolation is unnecessary.
     -->
     <type name="Magento\Framework\View\Result\Page">
         <arguments>
@@ -68,24 +38,29 @@
     </type>
 
     <!--
-        Reset the opengento session registry between requests so each request only manages the
-        sessions it actually starts. The base SessionRegistry does not implement
-        ResetAfterRequestInterface, so its WeakMap accumulates sessions from every previous request
-        on this worker. startSessions() then calls start() on all of them at the top of each new
-        request — including sessions from a different area. This causes, for example, CustomerSession
-        (from a prior frontend request) to be started inside an admin request with frontend session
-        config (session.cookie_path='/'), which makes admin login's regenerateId() send
-        Set-Cookie: PHPSESSID=<new_id>; Path='/' — overwriting the browser's frontend cookie. Our
-        subclass clears the WeakMap in _resetState(); sessions are lazily started as normal instead.
+        Reset the opengento SessionRegistry (WeakMap of started sessions) between requests so each request
+        only closes the sessions it started, not an accumulation from prior requests/areas. (Overriding an
+        opengento class is the one <preference> category we keep — see OPENGENTO_UPSTREAM_CHANGES.md.)
     -->
     <preference for="Opengento\Application\App\Session\SessionRegistry"
                 type="MageOS\WorkerMode\App\Session\SessionRegistry"/>
 
     <!--
-        FrontendConfig requires a scopeType so _scopeConfig->getValue() uses 'default' scope for
-        cookie settings (path, domain, lifetime) — matching the behaviour of the generic
-        Magento\Framework\Session\Config which is globally configured with SCOPE_TYPE_DEFAULT
-        in magento2-base app/etc/di.xml.
+        Lazily (re)start any session on first access this request. A SessionManager singleton's constructor
+        calls start() once per worker; on warm requests it is never called again, so storage stays bound to
+        a previous request's $_SESSION. This plugin runs start() before the first magic access (__call),
+        explicit getData(), the Customer/Auth entry methods (isLoggedIn/getCustomerId) that read storage
+        directly, and the TFA grant methods. Consolidates the former six per-session start() plugins;
+        afterGetCustomerId repairs a null customer id from a mid-request reference break.
+    -->
+    <type name="Magento\Framework\Session\SessionManager">
+        <plugin name="mage_os_worker_mode_session_start"
+                type="MageOS\WorkerMode\Plugin\Session\SessionStartPlugin"/>
+    </type>
+
+    <!--
+        FrontendConfig needs a scopeType so _scopeConfig->getValue() uses 'default' scope for cookie
+        settings (path, domain, lifetime) — matching the generic Magento\Framework\Session\Config.
     -->
     <type name="MageOS\WorkerMode\Session\FrontendConfig">
         <arguments>
@@ -93,31 +68,24 @@
         </arguments>
     </type>
 
-    <!--
-        Restore the correct area ObjectManager as getInstance() target before each request.
-
-        ObjectManager::$_instance is a static property overwritten by every new OM constructor.
-        After the first webapi_rest (or adminhtml) bootstrap, getInstance() returns the wrong area's
-        OM for all subsequent frontend requests. FrontController lazily inits appState via getInstance()
-        and then calls areaList.getArea('webapi_rest'), which runs _initDesign() and stamps
-        Design._area = 'webapi_rest'. This plugin sets $_instance = the creating bootstrap's OM before
-        the scope-specific plugin chain runs, restoring correct getInstance() behaviour for the request.
-    -->
     <type name="Opengento\Application\App\Http">
+        <!--
+            Restore the correct area OM as ObjectManager::getInstance()'s target before the request runs.
+            The static $_instance is overwritten by every new OM constructor, so after the first
+            webapi_rest/adminhtml bootstrap getInstance() returns the wrong area's OM on later frontend
+            requests (wrong asset URLs / robots / body class). (OPENGENTO_UPSTREAM_CHANGES.md "Change 3".)
+        -->
         <plugin name="mage_os_worker_mode_om_context"
                 type="MageOS\WorkerMode\Plugin\App\ObjectManagerContextPlugin"
                 sortOrder="1"/>
+        <!--
+            LazyGhostReset (ResetAfterRequestInterface): force-initialises each lazy ghost then
+            reflection-resets Design (_area/_theme), Page\Config, Area (_loadedParts['design']),
+            AdminSessionsManager and admin Widget\Context ButtonList — the no-patch stand-in for the
+            framework Resetter fix (OPENGENTO_UPSTREAM_CHANGES.md "Change 4"). beforeLaunch is a no-op that
+            just gets the helper instantiated so the Resetter tracks it.
+        -->
+        <plugin name="mage_os_worker_mode_lazy_ghost_reset"
+                type="MageOS\WorkerMode\Model\Reset\LazyGhostReset"/>
     </type>
-
-    <!--
-        Clear Area._loadedParts['design'] between requests so _initDesign() re-runs.
-
-        After the first request, _loadedParts['design'] = true causes load(PART_DESIGN) to be a
-        no-op on every subsequent request. Since Design._resetState() clears _area and _theme, the
-        Area must re-run _initDesign() to call setArea() + setDefaultDesignTheme() and restore the
-        correct theme so asset URLs use the right area/theme path instead of '_view'.
-    -->
-    <preference for="Magento\Framework\App\Area"
-                type="MageOS\WorkerMode\Model\App\Area"/>
-
 </config>

@@ -5,7 +5,6 @@ namespace MageOS\WorkerMode\Plugin\Checkout\Model;
 
 use Magento\Checkout\Model\Session as CheckoutSession;
 use Magento\Framework\DB\Adapter\LockWaitException;
-use Magento\Framework\Exception\SessionException;
 use Magento\Quote\Api\Data\CartInterface;
 
 /**
@@ -31,11 +30,8 @@ class CheckoutSessionPlugin
      */
     public function aroundGetQuote(CheckoutSession $subject, callable $proceed): CartInterface
     {
-        try {
-            $subject->start();
-        } catch (SessionException) {
-            // Area code not set; session cannot be started yet.
-        }
+        // SessionStartPlugin starts the checkout session on first access (getQuote() reads getQuoteId(),
+        // a magic __call), so no explicit start() is needed here — this plugin only handles LockWait.
         try {
             return $proceed();
         } catch (LockWaitException $e) {

@@ -2,6 +2,8 @@
 
 This module makes Magento/MageOS run correctly under FrankenPHP worker mode. Every class here exists to fix a specific category of state-leakage bug. Before touching anything, understand the three mechanisms below.
 
+This module is written to sit on top of **stock `opengento/module-application`** with **no composer patch**. The corresponding upstream-fork fixes (the "ideal" that would let much of this module shrink) are tracked at the repo root in `OPENGENTO_UPSTREAM_CHANGES.md`; the living downstream plan (what we carry now, and when to remove it) is `OPENGENTO_DOWNSTREAM_PLAN.md`.
+
 ---
 
 ## Mechanism 1: ResetAfterRequestInterface
@@ -10,7 +12,11 @@ The `opengento/module-application` `Resetter` runs between every request. For an
 
 For classes that do *not* implement the interface, the Resetter falls back to `ReflectionProperty::setValue()` guided by `etc/reset.json`. On PHP 8.4+, this silently fails for lazy ghosts (see Mechanism 2).
 
-**Rule:** every subclass in this module that overrides state must implement `ResetAfterRequestInterface` and provide `_resetState()`. Never rely on `reset.json` for classes you own.
+We use this interface two ways:
+- **Subclass** a class we also need to change behaviourally (only `Model/View/Layout` — it overrides `isCacheable()`).
+- **`Model/Reset/LazyGhostReset`** — a single `ResetAfterRequestInterface` helper that resets classes we do *not* want to subclass. It force-initialises each target lazy ghost, then reflection-resets specific properties on the declaring class. This is the no-patch stand-in for the upstream Resetter fix.
+
+**Rule:** never rely on `reset.json` for a class whose reset actually matters on PHP 8.4 — route it through `LazyGhostReset` (or a subclass).
 
 ---
 
@@ -20,9 +26,9 @@ The DI container creates Interceptors as lazy ghosts (`ReflectionClass::newLazyG
 
 **Symptom pattern:** a property appears to reset between requests in isolation but keeps its old value in production worker mode. If the old value was from a `reset.json` entry that appeared to work in PHP 8.3 but broke on 8.4, this is the cause.
 
-**Fix:** subclass the class, implement `ResetAfterRequestInterface`, implement `_resetState()`. The method-call path initialises the ghost before writing — the reset lands in the live property slot.
+**Fix:** initialise the ghost *first*, then write. `LazyGhostReset` does exactly this — `ReflectionClass::initializeLazyObject()` then `ReflectionProperty::setValue()` on the declaring class — for `Design`, `Page\Config`, `Area`, `AdminSessionsManager` and the admin `Widget\Context` ButtonList. `Layout` gets the same effect for free because its `_resetState()` is a real method call on the subclass.
 
-This is why `Layout`, `Page\Config`, and `Design` are subclassed here. Their `reset.json` entries in opengento silently fail on PHP 8.4.
+(The upstream fix — patch the framework `Resetter` to initialise ghosts before reflecting — is `OPENGENTO_UPSTREAM_CHANGES.md` "Change 4". If it lands, `LazyGhostReset` can be deleted.)
 
 ---
 
@@ -30,9 +36,9 @@ This is why `Layout`, `Page\Config`, and `Design` are subclassed here. Their `re
 
 Each area (`global`, `frontend`, `adminhtml`, `webapi_rest`) loads a separate DI graph in the `BootstrapPool`. Plugins registered in `etc/di.xml` apply globally across all area bootstraps. Plugins registered in `etc/frontend/di.xml` apply only to the frontend bootstrap, and so on.
 
-**SessionCommitPlugin is deliberately registered in `adminhtml` and `webapi_rest` only.** Global registration alters the frontend session lifecycle and causes login failures and cart errors. See the `feedback_session_commit_area.md` memory for the full incident.
+**`SessionCommitPlugin` is deliberately registered in `adminhtml` and `webapi_rest` only.** Global registration alters the frontend session lifecycle and causes login failures and cart errors. See the `feedback_session_commit_area.md` memory for the full incident.
 
-**CustomerSessionPlugin is deliberately NOT registered in `adminhtml`.** The lazy startup path calls `CustomerSession::start()` with frontend cookie config inside the admin area, which corrupts admin login's `regenerateId()` call. SessionRegistry already prevents `startSessions()` from pre-starting CustomerSession in admin.
+**Session start is now global and self-limiting.** `SessionStartPlugin` (on `Magento\Framework\Session\SessionManager`, `etc/di.xml`) starts a session lazily only when the request actually touches it. Combined with the `SessionRegistry` reset (which stops opengento pre-starting every prior session), `CustomerSession` never lazy-starts inside an admin request — so no frontend-cookie-config `start()` corrupts admin `regenerateId()`. This replaces the old per-area `CustomerSessionPlugin`, which had to be manually excluded from adminhtml.
 
 ---
 
@@ -40,94 +46,77 @@ Each area (`global`, `frontend`, `adminhtml`, `webapi_rest`) loads a separate DI
 
 ```
 etc/
-  module.xml              — sequence: Opengento_Application, Magento_TwoFactorAuth,
-                            Magento_Security (AdminSessionsManager subclass extends it)
-  reset.json              — reset.json entries for third-party singletons we cannot subclass
-  di.xml                  — global: preferences (Layout, Design, Page\Config, Area,
-                            SessionRegistry), isIsolated=false, OM context plugin,
-                            FrontendConfig scopeType
-  adminhtml/di.xml        — Widget\Context preference, AdminSessionsManager preference,
-                            AdminAuthSession plugins, SessionCommitPlugin (admin 302 race fix),
-                            MessageManagerSessionPlugin (admin flash messages)
-  frontend/di.xml         — CustomerSession repair + FrontendConfig injection,
-                            CheckoutSession plugins, SuccessValidator plugin,
-                            PreserveOrderDataPlugin
-  webapi_rest/di.xml      — CustomerSession repair, CheckoutSession FrontendConfig injection,
-                            QuoteManagementPlugin (before placeOrder session bind),
+  module.xml              — sequence: Opengento_Application, Magento_TwoFactorAuth
+  reset.json              — reflection-reset entries for third-party singletons (fallback path only)
+  di.xml                  — global: Layout <preference>, SessionRegistry <preference>,
+                            isIsolated=false (Page/Layout result types), SessionStartPlugin,
+                            ConfigPlugin (html.lang), FrontendConfig scopeType, and two App\Http
+                            plugins (ObjectManagerContextPlugin + LazyGhostReset)
+  adminhtml/di.xml        — AuthSessionProcessLoginPlugin, SessionCommitPlugin (admin 302 race fix)
+  frontend/di.xml         — CustomerSession FrontendConfig injection, RegistrationPlugin,
+                            DefaultConfigProviderPlugin, CheckoutSessionPlugin, PreserveOrderDataPlugin
+  webapi_rest/di.xml      — CustomerSession + CheckoutSession FrontendConfig injection,
                             RestResponseFallbackPlugin, SessionCommitPlugin
 
 App/Session/
-  SessionRegistry.php     — clears WeakMap in _resetState(); prevents cross-request/cross-area
-                            session accumulation
+  SessionRegistry.php     — clears the WeakMap in _resetState(); prevents cross-request/cross-area
+                            session accumulation. Overrides opengento's SessionRegistry — this is the
+                            one <preference> against an opengento class we intentionally keep.
 
-Block/Backend/Widget/
-  Context.php             — clears _buttons in _resetState(); prevents ButtonList accumulation
-
-Model/App/
-  Area.php                — clears _loadedParts['design'] in _resetState(); forces _initDesign()
-                            to re-run so setArea() + setDefaultDesignTheme() restore the theme
-
-Model/Security/
-  AdminSessionsManager.php — ResetAfterRequestInterface subclass; nulls cached $currentSession
-                            in _resetState() so admin re-login after logout works on warm workers
+Model/Reset/
+  LazyGhostReset.php      — ResetAfterRequestInterface helper, registered as a no-op beforeLaunch
+                            plugin on Opengento\Application\App\Http (so DI instantiates it and the
+                            Resetter tracks it). _resetState() force-initialises each target lazy ghost
+                            then reflection-resets: Design (_area/_theme), Page\Config
+                            (pageLayout/elements/includes/metadata), Area (_loadedParts['design']),
+                            AdminSessionsManager (currentSession), admin Widget\Context ButtonList
+                            (_buttons). No-patch stand-in for the framework Resetter fix.
 
 Model/View/
-  Design.php              — ResetAfterRequestInterface subclass; fixes PHP 8.4 lazy ghost failure
-                            for _area and _theme (was in reset.json, silently failed)
-  Layout.php              — ResetAfterRequestInterface subclass; _resetState() clears _xml
-                            (root cause of stale-layout / checkout success depersonalize bug),
-                            _blocks, readerContext (not in reset.json), and all other layout state
+  Layout.php              — ResetAfterRequestInterface subclass. Kept a subclass (not folded into
+                            LazyGhostReset) because it ALSO overrides isCacheable()/generateElements().
+                            _resetState() clears _xml (root cause of the stale-layout / checkout-success
+                            depersonalize bug), _blocks, readerContext (not in opengento's reset.json),
+                            and other layout state.
 
 Plugin/App/
-  ObjectManagerContextPlugin.php  — restores ObjectManager::$_instance to the correct area OM
-                                    before each request (static property overwritten per bootstrap)
+  ObjectManagerContextPlugin.php  — restores ObjectManager::$_instance to the correct area OM before
+                                    each request (the static is overwritten by every bootstrap)
   RestResponseFallbackPlugin.php  — fixes opengento's handleHttpResult() swallowing REST exceptions
-  SessionCommitPlugin.php         — calls closeSessions() before sendResponse() (admin + REST)
+  SessionCommitPlugin.php         — closeSessions() before sendResponse() (admin + REST only)
 
 Plugin/Checkout/Block/
   RegistrationPlugin.php          — catches InputException from OrderRepository::get(0) when
-                                    last_order_id is missing; returns '' so block hides silently
+                                    last_order_id is missing; returns '' so the block hides silently
 
 Plugin/Checkout/Model/
-  CheckoutSessionPlugin.php       — aroundGetQuote: starts session, retries on LockWaitException
-  DefaultConfigProviderPlugin.php — last-resort: repairs CustomerSession and retries getConfig()
-                                    if NoSuchEntityException from getCustomerId()=null
+  CheckoutSessionPlugin.php       — aroundGetQuote: retries getQuote() on LockWaitException (session
+                                    start itself is handled by SessionStartPlugin)
+  DefaultConfigProviderPlugin.php — last-resort: repairs CustomerSession + retries getConfig() on
+                                    NoSuchEntityException from getCustomerId()=null
 
 Plugin/Checkout/Model/Session/
-  PreserveOrderDataPlugin.php     — safety net: saves/restores last_real_order_id across
-                                    clearStorage() on checkout_onepage_success only
-  SuccessValidatorPlugin.php      — calls CheckoutSession::start() before isValid() reads __call
-                                    magic data (getLastSuccessQuoteId etc.)
-
-Plugin/Customer/Model/
-  CustomerSessionPlugin.php       — repairs CustomerSession before isLoggedIn() (reference break
-                                    + lazy startup); uses FrontendConfig for session name
-
-Plugin/Message/
-  MessageManagerSessionPlugin.php — starts Message\Session before getMessages()/addMessage()
-                                    so admin flash messages survive POST -> 302 -> GET (adminhtml)
-
-Plugin/Quote/Model/
-  QuoteManagementPlugin.php       — calls CheckoutSession::start() before placeOrder() so
-                                    setLastOrderId() writes to bound $_SESSION not orphaned _data
+  PreserveOrderDataPlugin.php     — safety net: saves/restores last_real_order_id across clearStorage()
+                                    on checkout_onepage_success only
 
 Plugin/Session/
-  AdminAuthSessionPlugin.php      — calls Auth\Session::start() before isLoggedIn(); lazy start
-                                    needed because SessionRegistry no longer pre-starts sessions
-  AuthSessionProcessLoginPlugin.php — backstop for start() failure before processLogin();
-                                    re-establishes session reference before regenerateId()
+  SessionStartPlugin.php          — THE session-lifecycle plugin (global, on Magento\Framework\Session\
+                                    SessionManager). Lazily starts any session on first access this
+                                    request — magic __call, explicit getData, the Customer/Auth entry
+                                    methods that read storage directly (isLoggedIn/getCustomerId), and
+                                    the TFA grant methods. afterGetCustomerId repairs a null id from a
+                                    mid-request reference break. Consolidates the former six per-session
+                                    start() plugins.
+  AuthSessionProcessLoginPlugin.php — admin-login backstop: re-establishes the session reference before
+                                    regenerateId() when start() failed silently before setUser()
 
 Plugin/View/Page/
-  ConfigPlugin.php                — ensures html.lang is always set after _resetState() clears
-                                    elements=[]; prevents Intl.NumberFormat breakage
+  ConfigPlugin.php                — re-adds html.lang after reset clears elements=[]; prevents
+                                    Intl.NumberFormat breakage (ElasticSuite price slider)
 
 Session/
-  FrontendConfig.php              — stores session.name='PHPSESSID' in $options so initIniOptions()
-                                    always resets ini contamination from prior admin requests
-
-View/Page/
-  Config.php                      — ResetAfterRequestInterface subclass; fixes PHP 8.4 lazy ghost
-                                    failure for elements, pageLayout, includes, metadata
+  FrontendConfig.php              — stores session.name='PHPSESSID' so initIniOptions() always undoes
+                                    'admin' ini contamination left by a prior admin request on the worker
 ```
 
 Hyvä-specific classes live in the companion module `MageOS_WorkerModeHyva` (see below).
@@ -136,14 +125,14 @@ Hyvä-specific classes live in the companion module `MageOS_WorkerModeHyva` (see
 
 ## reset.json entries (third-party singletons)
 
-The `etc/reset.json` in this module covers classes we cannot subclass:
+The `etc/reset.json` in this module covers stateful third-party classes reset via the reflection fallback:
 
 | Class | Properties reset | Why |
 |---|---|---|
 | `ScheduledStructure\Helper` | `counter` | Accumulates between requests |
 | `CspNonceProvider` | `nonce` | Nonce must be fresh per request |
 | `DynamicCollector` | `added` | CSP directives accumulate |
-| `Magento\Theme\Model\View\Design` | `_area`, `_theme` | Fallback; our subclass is the real fix |
+| `Magento\Theme\Model\View\Design` | `_area`, `_theme` | Fallback only — see note below |
 | `GroupedCollection` | `assets`, `groups` | Asset collection carries previous page's assets |
 | `FlyweightFactory` | `themes`, `themesByPath` | Theme cache grows unbounded; has only a Proxy (not a lazy ghost), so reflection reset works |
 | `Rest\InputParamsResolver` | `route` | Stale route from prior REST request |
@@ -151,23 +140,23 @@ The `etc/reset.json` in this module covers classes we cannot subclass:
 | `Page\Layout\Reader` | `pageLayoutMerge` | Stale merged page layout |
 | `ScheduledStructure` | all fields | Layout build artifacts |
 
-Note: the `Design` entry is a fallback. Our `Model/View/Design` subclass handles the real reset via `ResetAfterRequestInterface`. The `reset.json` entry remains for defence-in-depth.
+**Note on the `Design` entry:** on PHP 8.4 lazy ghosts the reflection path silently no-ops, so `LazyGhostReset` is what actually resets `Design._area`/`_theme`. The `reset.json` entry is harmless and kept only as defence-in-depth for non-lazy / older-PHP paths. Do not treat it as the working reset.
 
 ---
 
 ## Companion module: MageOS_WorkerModeHyva
 
-Hyvä-specific resets live in `mage-os/module-worker-mode-hyva` (`WorkerModeHyva/` sibling directory). That module sequences after both `MageOS_WorkerMode` and `Hyva_Theme`, so it only compiles on Hyvä stores. A Luma store installs only the base module; `setup:di:compile` never touches the Hyvä classes.
+Hyvä-specific resets live in `mage-os/module-worker-mode-hyva` (`WorkerModeHyva/` sibling directory). That module sequences after both `MageOS_WorkerMode` and `Hyva_Theme`, so it only compiles on Hyvä stores. A Luma store installs only the base module.
 
 What the companion module owns:
 
 | File | Purpose |
 | --- | --- |
-| `ViewModel/HyvaCsp.php` | `ResetAfterRequestInterface` subclass; clears `memoizedPolicies` and `memoizedAreaCode` via reflection (private parent props) |
-| `etc/di.xml` | `<preference for="Hyva\Theme\ViewModel\HyvaCsp">` pointing to the subclass above |
+| `Model/Reset/HyvaCspReset.php` | `ResetAfterRequestInterface` helper, registered as a no-op beforeLaunch plugin on `App\Http`. Force-inits the `Hyva\Theme\ViewModel\HyvaCsp` lazy ghost then reflection-clears `memoizedPolicies` + `memoizedAreaCode` (private parent props) |
+| `etc/di.xml` | registers `HyvaCspReset` as the `App\Http` plugin (no `<preference>`) |
 | `etc/reset.json` | `\Hyva\GraphqlTokens\CustomerData\CartPlugin` — stale quote reference |
 
-**Note on ProductListItem (`OutOfBoundsException`):** this base module's `isIsolated=false` setting on `Page` and `Layout` result types already prevents the shared-singleton/isolated-layout mismatch that causes this exception. No `ProductListItem` ViewModel override is needed in the companion module.
+**Note on ProductListItem (`OutOfBoundsException`):** this base module's `isIsolated=false` on `Page`/`Layout` result types already prevents the shared-singleton/isolated-layout mismatch that causes this exception. No `ProductListItem` ViewModel override is needed.
 
 ---
 
@@ -177,30 +166,31 @@ What the companion module owns:
 
 **Do not** register `SessionCommitPlugin` globally in `etc/di.xml`. It must be area-scoped (`adminhtml` and `webapi_rest` only). Global registration runs `closeSessions()` after every frontend response, closing the frontend session before Magento's own session lifecycle has finished.
 
-**Do not** add a new stateful singleton to `reset.json` if you can subclass it. Use the `ResetAfterRequestInterface` + `_resetState()` pattern. reset.json is a fallback for third-party classes only.
+**Do not** add a new stateful singleton to `reset.json` if its reset matters on PHP 8.4 — the reflection path silently fails on lazy ghosts. Route it through `LazyGhostReset` (or subclass it).
 
-**Do not** set `isIsolated=true` on `Page` or `Layout` result types. The `reset.json` + `ResetAfterRequestInterface` mechanism already resets layout state between requests. Isolation creates a private layout instance per request, breaking Hyvä's `ProductListItem` view model which holds the shared `LayoutInterface` singleton.
+**Do not** set `isIsolated=true` on `Page` or `Layout` result types. The reset mechanism already resets layout state between requests. Isolation creates a private layout instance per request, breaking Hyvä's `ProductListItem` view model which holds the shared `LayoutInterface` singleton.
 
-**Do not** inject `CustomerSession` into admin-area code paths. The lazy startup fix in `CustomerSessionPlugin` must not fire in the admin area. If you need a new plugin that touches `CustomerSession`, register it in `frontend/di.xml` and `webapi_rest/di.xml` only.
+**Do not** re-introduce per-session start plugins (`CustomerSessionPlugin`, `AdminAuthSessionPlugin`, a `SuccessValidator`/`QuoteManagement` start plugin, etc.). `SessionStartPlugin` is the single global entry point; add a new `before<Method>` there if a code path reads session storage without first triggering a start. Do NOT add a generalized `after__call` re-bind — that regressed and was fully reverted (see the `project_worker_session_redesign` memory).
 
-**When adding a new `ResetAfterRequestInterface` subclass:**
-1. Add the class to the appropriate directory
-2. Add a `<preference>` in `etc/di.xml` (global) or the relevant area DI file
-3. Do NOT add a corresponding `reset.json` entry for the same class — the two mechanisms compete
+**When a class needs resetting between requests:**
+1. If you also need to change its behaviour → subclass it, implement `ResetAfterRequestInterface`, add a `<preference>` (like `Layout`).
+2. Otherwise → add it to `LazyGhostReset::_resetState()` (force-init the ghost, then reflection-reset the declaring class's properties).
+3. Do NOT also add a `reset.json` entry for the same class — the two mechanisms compete.
 
 ---
 
 ## Interaction with opengento/module-application
 
 The opengento package provides:
-- `BootstrapPool` — creates and caches one `AppBootstrap` per area code
-- `SessionRegistry` — `WeakMap` of sessions started in the current request (our subclass clears this)
+- `BootstrapPool` — creates and caches one `AppBootstrap` (and OM) per area code
+- `SessionRegistry` — `WeakMap` of sessions started in the current request (our subclass clears it)
 - `Resetter` — iterates `reset.json` entries + calls `_resetState()` on `ResetAfterRequestInterface` implementations
 - `App\Http` — the request handler that calls `launch()`, then `resetState()` in a `finally` block
 
-This module intercepts `App\Http` via plugins in three areas:
+This module intercepts `App\Http` via plugins:
 - `ObjectManagerContextPlugin` (global, sortOrder=1) — restores `$_instance` before the area bootstrap runs
+- `LazyGhostReset` (global, no-op `beforeLaunch`) — exists so the Resetter tracks it; does the lazy-ghost resets in `_resetState()`
 - `RestResponseFallbackPlugin` (webapi_rest, sortOrder=100) — fixes empty REST responses
 - `SessionCommitPlugin` (adminhtml + webapi_rest, sortOrder=10000) — commits sessions before sendResponse
 
-sortOrder=10000 on `SessionCommitPlugin` ensures it runs last among `afterLaunch` plugins so all request processing (including session writes) has completed before `closeSessions()` is called.
+sortOrder=10000 on `SessionCommitPlugin` ensures it runs last among `afterLaunch` plugins, so all request processing (including session writes) has completed before `closeSessions()` is called.
