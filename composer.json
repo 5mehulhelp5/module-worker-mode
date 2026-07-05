@@ -18,7 +18,7 @@
     "require": {
         "php": "~8.0.0 || ~8.1.0 || ~8.2.0 || ~8.3.0 || ~8.4.0 || ~8.5.0",
         "opengento/magento2-frankenphp-base": "^0.9.4",
-        "opengento/module-application": "*",
+        "opengento/module-application": "0..11.2",
         "magento/module-two-factor-auth": "*"
     },
     "suggest": {
