@@ -88,4 +88,8 @@
         <plugin name="mage_os_worker_mode_lazy_ghost_reset"
                 type="MageOS\WorkerMode\Model\Reset\LazyGhostReset"/>
     </type>
+    <type name="Magento\Framework\App\AreaList">
+        <plugin name="mage_os_worker_mode_area_normalize_front_name"
+                type="MageOS\WorkerMode\Plugin\App\NormalizeFrontNamePlugin"/>
+    </type>
 </config>
