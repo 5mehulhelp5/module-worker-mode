@@ -38,5 +38,39 @@
         "scheduledPaths": [],
         "elementsToSort": [],
         "brokenParent": []
+    },
+    "\\Magento\\Search\\Model\\QueryFactory": {
+        "query": null
+    },
+    "\\Magento\\Catalog\\Helper\\Data": {
+        "_categoryPath": null
+    },
+    "\\Magento\\Catalog\\Model\\Product\\ProductList\\ToolbarMemorizer": {
+        "order": null,
+        "direction": null,
+        "mode": null,
+        "limit": null,
+        "isMemorizingAllowed": null
+    },
+    "\\Magento\\Eav\\Model\\ResourceModel\\Entity\\Attribute": {
+        "storeLabelsCache": []
+    },
+    "\\Magento\\Swatches\\Helper\\Data": {
+        "swatchesCache": []
+    },
+    "\\Smile\\ElasticsuiteCatalog\\Model\\Autocomplete\\Product\\ItemFactory": {
+        "priceRenderer": null
+    },
+    "\\Smile\\ElasticsuiteCatalog\\Model\\ResourceModel\\Product\\Fulltext\\Collection": {
+        "_items": [],
+        "_totalRecords": null,
+        "_isCollectionLoaded": false,
+        "queryResponse": null,
+        "query": null,
+        "filters": [],
+        "queryFilters": [],
+        "facets": [],
+        "isSpellchecked": false,
+        "originalPageSize": false
     }
 }
